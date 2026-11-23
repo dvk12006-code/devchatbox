@@ -13,5 +13,7 @@ services:
         value: https://api.openai.com/v1
       - key: OPENAI_MODEL
         value: gpt-4o-mini
+      - key: OPENAI_TRANSCRIPTION_MODEL
+        value: whisper-1
       - key: OPENAI_API_KEY
         sync: false

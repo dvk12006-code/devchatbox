@@ -22,9 +22,11 @@ try {
 }
 const dist = resolve(root, 'dist')
 const port = Number(process.env.PORT || 3001)
-const maxBodyBytes = 64 * 1024
+const maxBodyBytes = 8 * 1024 * 1024
+const maxAudioBytes = 5 * 1024 * 1024
 const maxMessages = 20
 const maxMessageLength = 6000
+const maxChatCharacters = 30_000
 const mimeTypes = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -83,7 +85,7 @@ function validateMessages(value) {
       return null
     }
     totalLength += message.content.length
-    if (totalLength > maxBodyBytes / 2) return null
+    if (totalLength > maxChatCharacters) return null
     messages.push({ role: message.role, content: message.content })
   }
   if (messages[messages.length - 1].role !== 'user') return null
@@ -157,6 +159,142 @@ async function handleChat(request, response) {
   sendJson(response, 200, { answer: content })
 }
 
+async function handleTranscription(request, response) {
+  if (!process.env.OPENAI_API_KEY) {
+    sendJson(response, 503, {
+      error: 'AI is not configured. Add OPENAI_API_KEY to the service environment.',
+      code: 'AI_NOT_CONFIGURED',
+    })
+    return
+  }
+
+  const body = await readJson(request)
+  const supportedTypes = ['audio/webm', 'audio/mp4', 'audio/ogg', 'audio/wav', 'audio/mpeg']
+  if (
+    typeof body?.audio !== 'string' ||
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(body.audio) ||
+    typeof body?.mimeType !== 'string' ||
+    !supportedTypes.includes(body.mimeType)
+  ) {
+    sendJson(response, 400, { error: 'Provide a supported audio recording.' })
+    return
+  }
+
+  const audio = Buffer.from(body.audio, 'base64')
+  if (audio.length === 0 || audio.length > maxAudioBytes) {
+    sendJson(response, 413, { error: 'Voice recordings must be smaller than 5 MB.' })
+    return
+  }
+
+  const baseUrl = (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, '')
+  const form = new FormData()
+  form.append('file', new Blob([audio], { type: body.mimeType }), `voice.${body.mimeType.split('/')[1]}`)
+  form.append('model', process.env.OPENAI_TRANSCRIPTION_MODEL || 'whisper-1')
+
+  let upstream
+  try {
+    upstream = await fetch(`${baseUrl}/audio/transcriptions`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
+      body: form,
+      signal: AbortSignal.timeout(60_000),
+    })
+  } catch (error) {
+    console.error('Audio transcription request failed:', error instanceof Error ? error.message : 'Unknown error')
+    sendJson(response, 502, { error: 'Could not reach the transcription provider. Please try again.' })
+    return
+  }
+
+  if (!upstream.ok) {
+    console.error('Audio transcription provider returned HTTP', upstream.status)
+    sendJson(response, upstream.status === 429 ? 429 : 502, {
+      error: upstream.status === 429
+        ? 'The transcription provider is rate-limiting requests. Please try again shortly.'
+        : 'The transcription provider could not process this recording. Check your provider settings.',
+    })
+    return
+  }
+
+  let result
+  try {
+    result = await upstream.json()
+  } catch {
+    sendJson(response, 502, { error: 'The transcription provider returned an invalid response.' })
+    return
+  }
+  if (typeof result?.text !== 'string' || !result.text.trim()) {
+    sendJson(response, 502, { error: 'No speech was detected in that recording.' })
+    return
+  }
+  sendJson(response, 200, { transcript: result.text })
+}
+
+async function handleResearch(url, response) {
+  const query = url.searchParams.get('q')?.trim()
+  if (!query || query.length > 200) {
+    sendJson(response, 400, { error: 'Enter a search query of up to 200 characters.' })
+    return
+  }
+
+  const searchUrl = `https://duckduckgo.com/?q=${encodeURIComponent(query)}`
+  const endpoint = new URL('https://api.duckduckgo.com/')
+  endpoint.searchParams.set('q', query)
+  endpoint.searchParams.set('format', 'json')
+  endpoint.searchParams.set('no_html', '1')
+  endpoint.searchParams.set('skip_disambig', '1')
+
+  let upstream
+  try {
+    upstream = await fetch(endpoint, {
+      headers: { Accept: 'application/json', 'User-Agent': 'AI-Assistant/1.0' },
+      signal: AbortSignal.timeout(12_000),
+    })
+  } catch (error) {
+    console.error('Research provider request failed:', error instanceof Error ? error.message : 'Unknown error')
+    sendJson(response, 502, { error: 'Could not reach the research provider. Try web search instead.', searchUrl })
+    return
+  }
+  if (!upstream.ok) {
+    sendJson(response, 502, { error: 'The research provider is temporarily unavailable.', searchUrl })
+    return
+  }
+
+  let result
+  try {
+    result = await upstream.json()
+  } catch {
+    sendJson(response, 502, { error: 'The research provider returned an invalid response.', searchUrl })
+    return
+  }
+
+  const results = []
+  if (result.AbstractText && result.AbstractURL) {
+    results.push({
+      title: result.Heading || query,
+      summary: result.AbstractText,
+      url: result.AbstractURL,
+    })
+  }
+
+  const topicQueue = [...(Array.isArray(result.RelatedTopics) ? result.RelatedTopics : [])]
+  while (topicQueue.length && results.length < 6) {
+    const topic = topicQueue.shift()
+    if (Array.isArray(topic?.Topics)) {
+      topicQueue.unshift(...topic.Topics)
+      continue
+    }
+    if (typeof topic?.Text !== 'string' || typeof topic?.FirstURL !== 'string') continue
+    const separator = topic.Text.indexOf(' - ')
+    results.push({
+      title: separator < 0 ? topic.Text : topic.Text.slice(0, separator),
+      summary: separator < 0 ? topic.Text : topic.Text.slice(separator + 3),
+      url: topic.FirstURL,
+    })
+  }
+
+  sendJson(response, 200, { query, results, searchUrl })
+}
+
 async function serveStatic(request, response, pathname) {
   let requestedPath
   try {
@@ -204,6 +342,14 @@ const server = createServer(async (request, response) => {
     }
     if (url.pathname === '/api/chat' && request.method === 'POST') {
       await handleChat(request, response)
+      return
+    }
+    if (url.pathname === '/api/transcribe' && request.method === 'POST') {
+      await handleTranscription(request, response)
+      return
+    }
+    if (url.pathname === '/api/research' && request.method === 'GET') {
+      await handleResearch(url, response)
       return
     }
     if (url.pathname.startsWith('/api/')) {
