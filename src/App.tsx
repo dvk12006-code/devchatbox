@@ -29,7 +29,9 @@ import {
   X,
 } from 'lucide-react'
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type FormEvent, type PointerEvent } from 'react'
+import type { User } from '@supabase/supabase-js'
 import type { CreatureState } from './components/Creature'
+import { isSupabaseConfigured, supabase } from './lib/supabase'
 import './App.css'
 
 const Creature = lazy(() => import('./components/Creature'))
@@ -84,7 +86,7 @@ const sectionDetails: Record<Exclude<Section, 'Home'>, { eyebrow: string; title:
   'Task center': {
     eyebrow: 'PERSONAL TASK LIST',
     title: 'Turn intention into action.',
-    description: 'Create and track tasks saved in this browser.',
+    description: 'Create and track tasks saved to your private account.',
   },
   Research: {
     eyebrow: 'LIVE WEB RESEARCH',
@@ -92,9 +94,9 @@ const sectionDetails: Record<Exclude<Section, 'Home'>, { eyebrow: string; title:
     description: 'Search for a topic to see sourced summaries or open full web results.',
   },
   Memory: {
-    eyebrow: 'LOCAL CONVERSATION HISTORY',
+    eyebrow: 'PRIVATE CONVERSATION HISTORY',
     title: 'Your context, on this device.',
-    description: 'Chat history can be stored in this browser. It is not shared between devices.',
+    description: 'Your saved conversation is private to your account and available across devices.',
   },
   Settings: {
     eyebrow: 'SYSTEM CONFIGURATION',
@@ -105,50 +107,72 @@ const sectionDetails: Record<Exclude<Section, 'Home'>, { eyebrow: string; title:
 
 const defaultPreferences: Preferences = { saveHistory: true, speakReplies: false, reduceMotion: false }
 
-function readPreferences(): Preferences {
-  try {
-    const saved = window.localStorage.getItem('assistant-preferences')
-    return saved ? { ...defaultPreferences, ...JSON.parse(saved) } : defaultPreferences
-  } catch (error) {
-    console.warn('Could not load preferences from local storage.', error)
-    return defaultPreferences
+async function getAuthHeaders() {
+  if (!supabase) throw new Error('Authentication is not configured.')
+  const { data, error } = await supabase.auth.getSession()
+  if (error) throw error
+  if (!data.session) throw new Error('Sign in again to continue.')
+  return { Authorization: `Bearer ${data.session.access_token}` }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function readPreferences(value: unknown): Preferences {
+  if (!isRecord(value)) return defaultPreferences
+  return {
+    saveHistory: typeof value.saveHistory === 'boolean' ? value.saveHistory : defaultPreferences.saveHistory,
+    speakReplies: typeof value.speakReplies === 'boolean' ? value.speakReplies : defaultPreferences.speakReplies,
+    reduceMotion: typeof value.reduceMotion === 'boolean' ? value.reduceMotion : defaultPreferences.reduceMotion,
   }
 }
 
-function readMessages(): ChatMessage[] {
+function readMessages(value: unknown): ChatMessage[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((message): message is ChatMessage =>
+    isRecord(message) &&
+    (message.role === 'user' || message.role === 'assistant') &&
+    typeof message.content === 'string',
+  ).slice(-40)
+}
+
+function readTasks(value: unknown): LocalTask[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((task): task is LocalTask =>
+    isRecord(task) &&
+    typeof task.id === 'string' &&
+    typeof task.title === 'string' &&
+    typeof task.completed === 'boolean',
+  ).slice(0, 100)
+}
+
+function readStoredJson(key: string) {
   try {
-    const saved = window.localStorage.getItem('assistant-messages')
-    if (!saved) return []
-    const parsed: unknown = JSON.parse(saved)
-    if (!Array.isArray(parsed)) return []
-    return parsed.filter((message): message is ChatMessage =>
-      message !== null &&
-      typeof message === 'object' &&
-      (message.role === 'user' || message.role === 'assistant') &&
-      typeof message.content === 'string',
-    ).slice(-40)
+    const stored = window.localStorage.getItem(key)
+    if (stored === null) return { present: false, value: null as unknown }
+    try {
+      return { present: true, value: JSON.parse(stored) as unknown }
+    } catch (error) {
+      console.warn(`Could not parse legacy ${key} data.`, error)
+      return { present: true, value: null as unknown }
+    }
   } catch (error) {
-    console.warn('Could not load chat history from local storage.', error)
-    return []
+    console.warn(`Could not read legacy ${key} data.`, error)
+    return { present: false, value: null as unknown }
   }
 }
 
-function readTasks(): LocalTask[] {
-  try {
-    const saved = window.localStorage.getItem('assistant-tasks')
-    if (!saved) return []
-    const parsed: unknown = JSON.parse(saved)
-    if (!Array.isArray(parsed)) return []
-    return parsed.filter((task): task is LocalTask =>
-      task !== null &&
-      typeof task === 'object' &&
-      typeof task.id === 'string' &&
-      typeof task.title === 'string' &&
-      typeof task.completed === 'boolean',
-    ).slice(0, 100)
-  } catch (error) {
-    console.warn('Could not load tasks from local storage.', error)
-    return []
+function readLegacyState() {
+  const savedPreferences = readStoredJson('assistant-preferences')
+  const savedMessages = readStoredJson('assistant-messages')
+  const savedTasks = readStoredJson('assistant-tasks')
+  if (!savedPreferences.present && !savedMessages.present && !savedTasks.present) return null
+  const preferences = readPreferences(savedPreferences.value)
+  return {
+    preferences,
+    messages: preferences.saveHistory ? readMessages(savedMessages.value) : [],
+    tasks: readTasks(savedTasks.value),
   }
 }
 
@@ -163,18 +187,75 @@ function getGreeting(date: Date) {
   return 'Good evening'
 }
 
-function App() {
+function AuthScreen() {
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [isSignUp, setIsSignUp] = useState(false)
+  const [isSubmitting, setIsSubmitting] = useState(false)
+  const [error, setError] = useState('')
+  const [message, setMessage] = useState('')
+
+  const submitAuth = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!supabase || isSubmitting) return
+    setIsSubmitting(true)
+    setError('')
+    setMessage('')
+    try {
+      if (isSignUp) {
+        const { data, error: authError } = await supabase.auth.signUp({ email: email.trim(), password })
+        if (authError) throw authError
+        if (!data.session) setMessage('Check your email to confirm your account, then sign in.')
+      } else {
+        const { error: authError } = await supabase.auth.signInWithPassword({ email: email.trim(), password })
+        if (authError) throw authError
+      }
+    } catch (authError) {
+      setError(authError instanceof Error ? authError.message : 'Could not authenticate. Please try again.')
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
+  return (
+    <main className="auth-shell">
+      <div className="grain" />
+      <section className="auth-card">
+        <div className="brand-orbit auth-orbit"><span /></div>
+        <div className="eyebrow"><span className="eyebrow-line" /> PRIVATE AI WORKSPACE</div>
+        <h1>{isSignUp ? 'Create your account.' : 'Welcome back.'}</h1>
+        <p>Sign in to access your private chat history, tasks, and settings.</p>
+        <form className="auth-form" onSubmit={submitAuth}>
+          <label htmlFor="auth-email">EMAIL</label>
+          <input id="auth-email" type="email" autoComplete="email" required value={email} onChange={(event) => setEmail(event.target.value)} />
+          <label htmlFor="auth-password">PASSWORD</label>
+          <input id="auth-password" type="password" autoComplete={isSignUp ? 'new-password' : 'current-password'} minLength={6} required value={password} onChange={(event) => setPassword(event.target.value)} />
+          {error && <div className="auth-message error" role="alert">{error}</div>}
+          {message && <div className="auth-message" role="status">{message}</div>}
+          <button className="auth-submit" type="submit" disabled={isSubmitting}>
+            {isSubmitting ? 'PLEASE WAIT…' : isSignUp ? 'CREATE ACCOUNT' : 'SIGN IN'}
+          </button>
+        </form>
+        <button className="auth-switch" onClick={() => { setIsSignUp((current) => !current); setError(''); setMessage('') }}>
+          {isSignUp ? 'Already have an account? Sign in' : 'New here? Create an account'}
+        </button>
+      </section>
+    </main>
+  )
+}
+
+function AssistantWorkspace({ user, onSignOut }: { user: User; onSignOut: () => void }) {
   const [activeSection, setActiveSection] = useState<Section>('Home')
   const [creatureState, setCreatureState] = useState<CreatureState>('idle')
   const [prompt, setPrompt] = useState('')
   const [taskDraft, setTaskDraft] = useState('')
-  const [tasks, setTasks] = useState<LocalTask[]>(readTasks)
+  const [tasks, setTasks] = useState<LocalTask[]>([])
   const [researchQuery, setResearchQuery] = useState('')
   const [researchResults, setResearchResults] = useState<ResearchResult[]>([])
   const [researchUrl, setResearchUrl] = useState('')
   const [isResearching, setIsResearching] = useState(false)
-  const [preferences, setPreferences] = useState<Preferences>(readPreferences)
-  const [messages, setMessages] = useState<ChatMessage[]>(() => readPreferences().saveHistory ? readMessages() : [])
+  const [preferences, setPreferences] = useState<Preferences>(defaultPreferences)
+  const [messages, setMessages] = useState<ChatMessage[]>([])
   const [isSending, setIsSending] = useState(false)
   const [isListening, setIsListening] = useState(false)
   const [isTranscribing, setIsTranscribing] = useState(false)
@@ -195,6 +276,8 @@ function App() {
   const transcriptEnd = useRef<HTMLDivElement>(null)
   const [cursor, setCursor] = useState({ x: 0, y: 0 })
   const [time, setTime] = useState(() => new Date())
+  const [dataStatus, setDataStatus] = useState<'loading' | 'ready' | 'error'>('loading')
+  const [dataError, setDataError] = useState('')
 
   useEffect(() => {
     let active = true
@@ -217,6 +300,63 @@ function App() {
   }, [])
 
   useEffect(() => {
+    let active = true
+    const loadState = async () => {
+      if (!supabase) {
+        setDataError('Supabase is not configured for this deployment.')
+        setDataStatus('error')
+        return
+      }
+      const { data, error } = await supabase
+        .from('user_app_state')
+        .select('state')
+        .eq('user_id', user.id)
+        .maybeSingle()
+      if (!active) return
+      if (error) {
+        setDataError(`Could not load your account data: ${error.message}`)
+        setDataStatus('error')
+        return
+      }
+      let state = isRecord(data?.state) ? data.state : {}
+      if (!data) {
+        const legacyState = readLegacyState()
+        if (legacyState) {
+          const { error: migrationError } = await supabase
+            .from('user_app_state')
+            .upsert({
+              user_id: user.id,
+              state: legacyState,
+              updated_at: new Date().toISOString(),
+            }, { onConflict: 'user_id' })
+          if (!active) return
+          if (migrationError) {
+            setDataError(`Could not move your existing browser data to Supabase: ${migrationError.message}`)
+            setDataStatus('error')
+            return
+          }
+          for (const key of ['assistant-preferences', 'assistant-messages', 'assistant-tasks']) {
+            try {
+              window.localStorage.removeItem(key)
+            } catch (storageError) {
+              console.warn(`Could not remove migrated ${key} data.`, storageError)
+            }
+          }
+          state = legacyState
+        }
+      }
+      const savedPreferences = readPreferences(state.preferences)
+      setPreferences(savedPreferences)
+      setMessages(savedPreferences.saveHistory ? readMessages(state.messages) : [])
+      setTasks(readTasks(state.tasks))
+      setDataError('')
+      setDataStatus('ready')
+    }
+    void loadState()
+    return () => { active = false }
+  }, [user.id])
+
+  useEffect(() => {
     const timer = window.setInterval(() => {
       setTime(new Date())
       setDate(getFormattedDate())
@@ -225,25 +365,27 @@ function App() {
   }, [])
 
   useEffect(() => {
-    try {
-      window.localStorage.setItem('assistant-preferences', JSON.stringify(preferences))
-      if (preferences.saveHistory) {
-        window.localStorage.setItem('assistant-messages', JSON.stringify(messages.slice(-40)))
-      } else {
-        window.localStorage.removeItem('assistant-messages')
+    const client = supabase
+    if (dataStatus !== 'ready' || !client) return
+    const timer = window.setTimeout(async () => {
+      const { error } = await client
+        .from('user_app_state')
+        .upsert({
+          user_id: user.id,
+          state: {
+            preferences,
+            messages: preferences.saveHistory ? messages.slice(-40) : [],
+            tasks,
+          },
+          updated_at: new Date().toISOString(),
+        }, { onConflict: 'user_id' })
+      if (error) {
+        console.error('Could not save account data to Supabase:', error.message)
+        setNotice('Could not save your data to Supabase. Check your connection and try making a change again.')
       }
-    } catch (error) {
-      console.warn('Could not save assistant data to local storage.', error)
-    }
-  }, [messages, preferences])
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem('assistant-tasks', JSON.stringify(tasks))
-    } catch (error) {
-      console.warn('Could not save tasks to local storage.', error)
-    }
-  }, [tasks])
+    }, 350)
+    return () => window.clearTimeout(timer)
+  }, [dataStatus, messages, preferences, tasks, user.id])
 
   useEffect(() => {
     transcriptEnd.current?.scrollIntoView({ behavior: preferences.reduceMotion ? 'instant' : 'smooth' })
@@ -316,7 +458,7 @@ function App() {
     try {
       const response = await fetch('/api/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...await getAuthHeaders() },
         body: JSON.stringify({ messages: nextMessages }),
       })
       const result = await response.json() as { answer?: unknown; error?: unknown }
@@ -416,7 +558,7 @@ function App() {
             }
             const response = await fetch('/api/transcribe', {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: { 'Content-Type': 'application/json', ...await getAuthHeaders() },
               body: JSON.stringify({ audio: btoa(binary), mimeType: blob.type }),
             })
             const result = await response.json() as { transcript?: unknown; error?: unknown }
@@ -575,6 +717,20 @@ function App() {
     `${command.label} ${command.detail}`.toLowerCase().includes(commandQuery.trim().toLowerCase()),
   )
 
+  if (dataStatus !== 'ready') {
+    return (
+      <main className="auth-shell">
+        <section className="auth-card">
+          <div className="eyebrow"><span className="eyebrow-line" /> PRIVATE AI WORKSPACE</div>
+          <h1>{dataStatus === 'loading' ? 'Loading your workspace.' : 'Your data is unavailable.'}</h1>
+          <p>{dataStatus === 'loading' ? 'Connecting to your private Supabase account…' : dataError}</p>
+          {dataStatus === 'error' && <button className="auth-submit" onClick={() => window.location.reload()}>RETRY</button>}
+          <button className="auth-switch" onClick={onSignOut}>SIGN OUT</button>
+        </section>
+      </main>
+    )
+  }
+
   return (
     <main className={`app-shell ${preferences.reduceMotion ? 'reduce-motion' : ''}`}>
       <div className="ambient ambient-one" />
@@ -612,7 +768,7 @@ function App() {
           >
             <Settings2 size={18} strokeWidth={1.6} />
           </button>
-          <button className="avatar" aria-label="User profile and settings" onClick={() => chooseSection('Settings')}>D</button>
+          <button className="avatar" aria-label="User profile and settings" title={user.email || 'Account'} onClick={() => chooseSection('Settings')}>{user.email?.[0]?.toUpperCase() || 'U'}</button>
         </div>
       </aside>
 
@@ -632,7 +788,7 @@ function App() {
               <Bell size={16} />
               <span className="notification-dot" />
             </button>
-            <button className="top-profile" onClick={() => chooseSection('Settings')}>D <ChevronDown size={12} /></button>
+            <button className="top-profile" onClick={() => chooseSection('Settings')}>{user.email?.split('@')[0] || 'Account'} <ChevronDown size={12} /></button>
           </div>
         </header>
 
@@ -770,7 +926,7 @@ function App() {
                 ))}
                 {isSending && <div className="chat-thinking"><span className="notice-indicator" /> NYX IS THINKING</div>}
                 {apiStatus === 'unconfigured' && (
-                  <div className="panel-note"><FileText size={14} /> Chat needs `OPENAI_API_KEY` set in the Render service environment before it can answer.</div>
+                  <div className="panel-note"><FileText size={14} /> Chat needs `OPENAI_API_KEY` set in Render → your service → Environment. Supabase stores account data; it does not provide the AI provider key.</div>
                 )}
                 <div ref={transcriptEnd} />
               </div>
@@ -781,7 +937,7 @@ function App() {
                   <input aria-label="New task" placeholder="Add a task..." maxLength={120} value={taskDraft} onChange={(event) => setTaskDraft(event.target.value)} />
                   <button type="submit" aria-label="Create task" disabled={!taskDraft.trim()}><Plus size={16} /></button>
                 </form>
-                <div className="task-summary">{tasks.filter((task) => !task.completed).length} OPEN <span>·</span> {tasks.length} TOTAL · SAVED ON THIS DEVICE</div>
+                <div className="task-summary">{tasks.filter((task) => !task.completed).length} OPEN <span>·</span> {tasks.length} TOTAL · SAVED TO YOUR ACCOUNT</div>
                 <div className="task-list">
                   {tasks.length === 0 && <div className="chat-empty">Your task list is empty. Add a task above to get started.</div>}
                   {tasks.map((task) => (
@@ -840,7 +996,7 @@ function App() {
             {activeSection === 'Settings' && (
               <div className="settings-options">
                 <button className="setting-row" aria-pressed={preferences.saveHistory} onClick={() => setPreferences((current) => ({ ...current, saveHistory: !current.saveHistory }))}>
-                  <span><strong>Save chat history</strong><small>Keep conversations in this browser only</small></span>
+                  <span><strong>Save chat history</strong><small>Keep conversations in your private Supabase account</small></span>
                   <i className={`setting-switch ${preferences.saveHistory ? 'on' : ''}`} />
                 </button>
                 <button className="setting-row" aria-pressed={preferences.speakReplies} onClick={() => {
@@ -853,7 +1009,11 @@ function App() {
                   <span><strong>Reduce motion</strong><small>Use less movement in the interface</small></span>
                   <i className={`setting-switch ${preferences.reduceMotion ? 'on' : ''}`} />
                 </button>
-                <div className="panel-note"><FileText size={14} /> The AI provider receives the messages you send. A provider API key is configured only on the server.</div>
+                <div className="panel-note"><FileText size={14} /> Your chat history, tasks, and preferences are stored privately in Supabase. The AI provider receives the messages you send; its key is configured only on the server.</div>
+                <button className="setting-row sign-out-row" onClick={onSignOut}>
+                  <span><strong>Sign out</strong><small>{user.email}</small></span>
+                  <X size={15} />
+                </button>
               </div>
             )}
             <button className="panel-return" onClick={() => chooseSection('Home')}>RETURN TO HOME <ArrowDownLeft size={13} /></button>
@@ -930,6 +1090,62 @@ function App() {
       </AnimatePresence>
     </main>
   )
+}
+
+function App() {
+  const [user, setUser] = useState<User | null>(null)
+  const [authLoading, setAuthLoading] = useState(isSupabaseConfigured)
+  const [authError, setAuthError] = useState('')
+
+  useEffect(() => {
+    if (!isSupabaseConfigured || !supabase) {
+      return
+    }
+    let active = true
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!active) return
+      setUser(session?.user ?? null)
+      setAuthLoading(false)
+    })
+    void supabase.auth.getSession().then(({ data, error }) => {
+      if (!active) return
+      if (error) {
+        setAuthError(error.message)
+      } else {
+        setUser(data.session?.user ?? null)
+      }
+      setAuthLoading(false)
+    })
+    return () => {
+      active = false
+      subscription.unsubscribe()
+    }
+  }, [])
+
+  const signOut = async () => {
+    if (!supabase) return
+    const { error } = await supabase.auth.signOut()
+    if (error) setAuthError(error.message)
+  }
+
+  if (!isSupabaseConfigured) {
+    return (
+      <main className="auth-shell">
+        <section className="auth-card">
+          <div className="eyebrow"><span className="eyebrow-line" /> SETUP REQUIRED</div>
+          <h1>Connect Supabase.</h1>
+          <p>Set `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` in the Render service environment, then redeploy.</p>
+        </section>
+      </main>
+    )
+  }
+  if (authLoading) {
+    return <main className="auth-shell"><section className="auth-card"><h1>Connecting your account…</h1></section></main>
+  }
+  if (authError && !user) {
+    return <main className="auth-shell"><section className="auth-card"><h1>Could not connect.</h1><p className="auth-message error">{authError}</p><button className="auth-submit" onClick={() => window.location.reload()}>RETRY</button></section></main>
+  }
+  return user ? <AssistantWorkspace key={user.id} user={user} onSignOut={() => { void signOut() }} /> : <AuthScreen />
 }
 
 export default App

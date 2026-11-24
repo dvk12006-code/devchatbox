@@ -67,6 +67,47 @@ async function readJson(request) {
   }
 }
 
+async function requireAuthenticatedUser(request, response) {
+  const supabaseUrl = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL
+  const supabaseKey = process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY
+  if (!supabaseUrl || !supabaseKey) {
+    sendJson(response, 503, {
+      error: 'Authentication is not configured. Set the Supabase URL and anon key in the service environment.',
+    })
+    return false
+  }
+
+  const authorization = request.headers.authorization || ''
+  const token = authorization.match(/^Bearer\s+([^\s]+)$/i)?.[1]
+  if (!token) {
+    sendJson(response, 401, { error: 'Sign in to use this service.' })
+    return false
+  }
+
+  let upstream
+  try {
+    upstream = await fetch(`${supabaseUrl.replace(/\/+$/, '')}/auth/v1/user`, {
+      headers: { apikey: supabaseKey, Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(10_000),
+    })
+  } catch (error) {
+    console.error('Supabase authentication request failed:', error instanceof Error ? error.message : 'Unknown error')
+    sendJson(response, 502, { error: 'Could not verify your account. Please try again.' })
+    return false
+  }
+
+  if (upstream.status === 401 || upstream.status === 403) {
+    sendJson(response, 401, { error: 'Your session has expired. Sign in again.' })
+    return false
+  }
+  if (!upstream.ok) {
+    console.error('Supabase authentication returned HTTP', upstream.status)
+    sendJson(response, 502, { error: 'Could not verify your account. Please try again.' })
+    return false
+  }
+  return true
+}
+
 function validateMessages(value) {
   if (!Array.isArray(value) || value.length === 0 || value.length > maxMessages) {
     return null
@@ -93,6 +134,7 @@ function validateMessages(value) {
 }
 
 async function handleChat(request, response) {
+  if (!(await requireAuthenticatedUser(request, response))) return
   if (!process.env.OPENAI_API_KEY) {
     sendJson(response, 503, {
       error: 'AI is not configured. Add OPENAI_API_KEY to the service environment.',
@@ -160,6 +202,7 @@ async function handleChat(request, response) {
 }
 
 async function handleTranscription(request, response) {
+  if (!(await requireAuthenticatedUser(request, response))) return
   if (!process.env.OPENAI_API_KEY) {
     sendJson(response, 503, {
       error: 'AI is not configured. Add OPENAI_API_KEY to the service environment.',
